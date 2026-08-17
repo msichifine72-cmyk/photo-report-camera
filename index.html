@@ -1,4 +1,4 @@
-<!-- 店舗写真報告システム v1.2.2 Camera.html -->
+<!-- 店舗写真報告システム v1.2.3 Camera.html -->
 <!DOCTYPE html>
 <html lang="ja">
 <head>
@@ -145,7 +145,7 @@
     if (!state.devices.length) return '';
     const scored = state.devices.map((d,i)=>{
       const label=(d.label||'').toLowerCase(); let score=0;
-      if (/cms[- ]?v46|dc400|ipevo|document|visualizer|書画|sanwa|ideao/.test(label)) score+=100;
+      if (/cms[- ]?v46|dc500|dc400|ipevo|document|visualizer|書画|sanwa|ideao/.test(label)) score+=100;
       if (/usb/.test(label)) score+=35;
       if (/back|rear|environment|背面/.test(label)) score+=isMobile?80:5;
       if (/integrated|built-in|facetime|front|user|前面/.test(label)) score-=isMobile?25:45;
@@ -154,16 +154,43 @@
     return scored[0].id;
   }
   function indexPenalty(i){return i*0.01;}
+  function deviceLabelFor(deviceId){ const found=state.devices.find(d=>d.deviceId===deviceId); return found?(found.label||''):''; }
+  function isDc500Device(deviceId){ return /(?:innex|ideao)?\s*dc[- ]?500|\bdc500\b/i.test(deviceLabelFor(deviceId)); }
+  function cameraConstraintCandidates(deviceId,isMobile){
+    if(!deviceId){
+      return [{facingMode:{ideal:'environment'},width:{ideal:3264},height:{ideal:2448},aspectRatio:{ideal:4/3}}];
+    }
+    const base={deviceId:{exact:deviceId}};
+    const normal=Object.assign({},base,{width:{ideal:3264},height:{ideal:2448},aspectRatio:{ideal:4/3},frameRate:{ideal:30,max:30}});
+    if(!isMobile && isDc500Device(deviceId)){
+      return [
+        Object.assign({},base,{width:{exact:3840},height:{exact:2160},frameRate:{ideal:30,max:30}}),
+        Object.assign({},base,{width:{ideal:3840},height:{ideal:2160},aspectRatio:{ideal:16/9},frameRate:{ideal:30,max:30}}),
+        normal,
+        base
+      ];
+    }
+    return [normal,base];
+  }
+  async function openCameraStream(deviceId,isMobile){
+    const candidates=cameraConstraintCandidates(deviceId,isMobile);
+    let lastError=null;
+    for(const constraints of candidates){
+      try { return await navigator.mediaDevices.getUserMedia({audio:false,video:constraints}); }
+      catch(error){
+        lastError=error;
+        const name=String(error&&error.name||'');
+        // 権限拒否は解像度条件を変えても解決しないため、追加要求を出さず直ちに終了する。
+        if(name==='NotAllowedError'||name==='PermissionDeniedError'||name==='SecurityError') throw error;
+      }
+    }
+    throw lastError||new Error('カメラへ接続できませんでした。');
+  }
   async function startCameraWithDevice(deviceId,isMobile){
     state.intentionalStop=true; stopStream(); state.intentionalStop=false;
     hideError(); setStatus('カメラへ接続しています','warning'); disableCapture(true); state.mode='starting';
-    const videoConstraints = deviceId ? {deviceId:{exact:deviceId},width:{ideal:3264},height:{ideal:2448},aspectRatio:{ideal:4/3},frameRate:{ideal:30,max:30}} : {facingMode:{ideal:'environment'},width:{ideal:3264},height:{ideal:2448},aspectRatio:{ideal:4/3}};
-    let stream;
-    try { stream=await navigator.mediaDevices.getUserMedia({audio:false,video:videoConstraints}); }
-    catch(firstError){
-      if (deviceId) stream=await navigator.mediaDevices.getUserMedia({audio:false,video:{deviceId:{exact:deviceId}}});
-      else throw firstError;
-    }
+    const mobile=typeof isMobile==='boolean'?isMobile:/Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+    const stream=await openCameraStream(deviceId,mobile);
     state.stream=stream; el.liveVideo.srcObject=stream;
     await el.liveVideo.play();
     const track=stream.getVideoTracks()[0];
@@ -172,7 +199,10 @@
     if (state.currentDeviceId) { localStorage.setItem(STORAGE_KEY,state.currentDeviceId); el.cameraSelect.value=state.currentDeviceId; }
     track.addEventListener('ended',()=>{ if(!state.intentionalStop) handleTrackEnded(); });
     await refreshDevices(); if(state.currentDeviceId) el.cameraSelect.value=state.currentDeviceId;
-    state.mode='live'; disableCapture(false); setStatus((track.label||'カメラ')+' ｜ '+(settings.width||el.liveVideo.videoWidth)+'×'+(settings.height||el.liveVideo.videoHeight),'ready');
+    const width=settings.width||el.liveVideo.videoWidth;
+    const height=settings.height||el.liveVideo.videoHeight;
+    const modeLabel=isDc500Device(state.currentDeviceId)&&width>=3800&&height>=2100?' ｜ 4K取得':'';
+    state.mode='live'; disableCapture(false); setStatus((track.label||'カメラ')+' ｜ '+width+'×'+height+modeLabel,'ready');
   }
   function stopStream(){ if(state.stream){ state.stream.getTracks().forEach(t=>t.stop()); state.stream=null; } el.liveVideo.srcObject=null; }
   function handleTrackEnded(){ state.mode='error'; disableCapture(true); showError('カメラが切断されました','USBケーブルを確認してください。再接続後に「カメラを再接続」を押します。'); postToParent({type:'PHOTO_REPORT_CAMERA_ERROR',message:'カメラが切断されました。USB接続を確認してください。'}); }
