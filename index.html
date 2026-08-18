@@ -1,4 +1,4 @@
-<!-- 店舗写真報告システム v1.2.3 Camera.html -->
+<!-- 店舗写真報告システム v1.2.4 Camera.html -->
 <!DOCTYPE html>
 <html lang="ja">
 <head>
@@ -68,7 +68,7 @@
   const CHANNEL = params.get('channel') || '';
   const PARENT_ORIGIN = params.get('parentOrigin') || '';
   const STORAGE_KEY = 'photoReportCamera.preferredDeviceId';
-  const state = { stream:null, devices:[], currentDeviceId:'', capturedBlob:null, capturedUrl:'', mode:'starting', captureLock:false, context:null, intentionalStop:false, reconnectTimer:null, transferTimer:null };
+  const state = { stream:null, devices:[], currentDeviceId:'', capturedBlob:null, capturedUrl:'', mode:'starting', captureLock:false, context:null, intentionalStop:false, reconnectTimer:null, transferTimer:null, reviewStreamDisconnected:false };
   const el = {};
   ['title','contextLabel','closeButton','liveVideo','capturedPreview','guide','cameraStatus','cameraStatusText','errorPanel','errorTitle','errorMessage','retryCameraButton','deviceRow','cameraSelect','switchCameraButton','captureControls','captureButton','reviewControls','retakeButton','sendButton','captureCanvas','progressOverlay','progressTitle','progressText','resultOverlay','resultIcon','resultTitle','resultText'].forEach(id=>el[id]=document.getElementById(id));
   document.addEventListener('DOMContentLoaded', init);
@@ -109,6 +109,7 @@
       el.title.textContent = state.context.systemTitle || '店舗写真報告カメラ';
       const parts = [state.context.storeName, state.context.leaderLabel, state.context.categoryLabel].filter(Boolean);
       el.contextLabel.textContent = parts.join(' ｜ ') || '撮影内容を確認してください。';
+      if (state.mode === 'live' && state.stream) disableCapture(false);
       return;
     }
     if (data.type === 'PHOTO_REPORT_PHOTO_ACCEPTED') { handlePhotoAccepted(data); return; }
@@ -187,8 +188,9 @@
     throw lastError||new Error('カメラへ接続できませんでした。');
   }
   async function startCameraWithDevice(deviceId,isMobile){
+    if(state.mode==='review'||state.mode==='sending') return;
     state.intentionalStop=true; stopStream(); state.intentionalStop=false;
-    hideError(); setStatus('カメラへ接続しています','warning'); disableCapture(true); state.mode='starting';
+    hideError(); setStatus('カメラへ接続しています','warning'); disableCapture(true); setDeviceControlsDisabled(true); state.mode='starting';
     const mobile=typeof isMobile==='boolean'?isMobile:/Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
     const stream=await openCameraStream(deviceId,mobile);
     state.stream=stream; el.liveVideo.srcObject=stream;
@@ -202,16 +204,24 @@
     const width=settings.width||el.liveVideo.videoWidth;
     const height=settings.height||el.liveVideo.videoHeight;
     const modeLabel=isDc500Device(state.currentDeviceId)&&width>=3800&&height>=2100?' ｜ 4K取得':'';
-    state.mode='live'; disableCapture(false); setStatus((track.label||'カメラ')+' ｜ '+width+'×'+height+modeLabel,'ready');
+    state.reviewStreamDisconnected=false; state.mode='live'; setDeviceControlsDisabled(false); disableCapture(!state.context); setStatus((track.label||'カメラ')+' ｜ '+width+'×'+height+modeLabel,'ready');
   }
   function stopStream(){ if(state.stream){ state.stream.getTracks().forEach(t=>t.stop()); state.stream=null; } el.liveVideo.srcObject=null; }
-  function handleTrackEnded(){ state.mode='error'; disableCapture(true); showError('カメラが切断されました','USBケーブルを確認してください。再接続後に「カメラを再接続」を押します。'); postToParent({type:'PHOTO_REPORT_CAMERA_ERROR',message:'カメラが切断されました。USB接続を確認してください。'}); }
+  function handleTrackEnded(){
+    if(state.mode==='review' && state.capturedBlob){
+      state.reviewStreamDisconnected=true; state.intentionalStop=true; stopStream(); state.intentionalStop=false;
+      disableCapture(true); setDeviceControlsDisabled(true);
+      setStatus('カメラが切断されました。撮影済み写真はそのまま使用できます','warning');
+      return;
+    }
+    state.reviewStreamDisconnected=false; state.mode='error'; disableCapture(true); setDeviceControlsDisabled(false); showError('カメラが切断されました','USBケーブルを確認してください。再接続後に「カメラを再接続」を押します。'); postToParent({type:'PHOTO_REPORT_CAMERA_ERROR',message:'カメラが切断されました。USB接続を確認してください。'});
+  }
   async function handleDeviceChange(){
     try { await refreshDevices(); if(state.currentDeviceId && !state.devices.some(d=>d.deviceId===state.currentDeviceId)) handleTrackEnded(); }
     catch(error){}
   }
   async function switchCamera(){
-    if(state.devices.length<2) return;
+    if(state.mode==='review'||state.mode==='sending'||state.devices.length<2) return;
     const index=Math.max(0,state.devices.findIndex(d=>d.deviceId===state.currentDeviceId));
     const next=state.devices[(index+1)%state.devices.length];
     try { await startCameraWithDevice(next.deviceId); } catch(error){ handleCameraError(error); }
@@ -224,7 +234,7 @@
     if(event.key==='Enter' || event.code==='Space') { event.preventDefault(); captureFrame(); }
   }
   async function captureFrame(){
-    if(state.mode!=='live' || state.captureLock || !state.stream) return;
+    if(state.mode!=='live' || state.captureLock || !state.stream || !state.context) return;
     state.captureLock=true; disableCapture(true);
     try {
       const width=el.liveVideo.videoWidth, height=el.liveVideo.videoHeight;
@@ -236,12 +246,23 @@
       const ctx=canvas.getContext('2d',{alpha:false}); ctx.fillStyle='#fff'; ctx.fillRect(0,0,tw,th); ctx.drawImage(el.liveVideo,0,0,tw,th);
       const quality=Math.min(Math.max(Number(state.context&&state.context.jpegQuality||0.90),0.5),0.98);
       const blob=await new Promise((resolve,reject)=>canvas.toBlob(b=>b?resolve(b):reject(new Error('写真を作成できませんでした。')),'image/jpeg',quality));
-      clearCaptured(); state.capturedBlob=blob; state.capturedUrl=URL.createObjectURL(blob); el.capturedPreview.src=state.capturedUrl;
-      el.capturedPreview.classList.remove('hidden'); el.guide.classList.add('hidden'); el.captureControls.classList.add('hidden'); el.reviewControls.classList.remove('hidden'); state.mode='review'; setStatus('撮影した写真を確認してください','ready');
+      clearCaptured(); state.reviewStreamDisconnected=false; state.capturedBlob=blob; state.capturedUrl=URL.createObjectURL(blob); el.capturedPreview.src=state.capturedUrl;
+      el.capturedPreview.classList.remove('hidden'); el.guide.classList.add('hidden'); el.captureControls.classList.add('hidden'); el.reviewControls.classList.remove('hidden'); state.mode='review'; setDeviceControlsDisabled(true); setStatus('撮影した写真を確認してください','ready');
     } catch(error){ handleCameraError(error); }
     finally { state.captureLock=false; if(state.mode==='live') disableCapture(false); }
   }
-  function retake(){ if(state.mode==='sending')return; clearCaptured(); el.capturedPreview.classList.add('hidden'); el.guide.classList.remove('hidden'); el.reviewControls.classList.add('hidden'); el.captureControls.classList.remove('hidden'); state.mode='live'; disableCapture(false); setStatus('撮影できます','ready'); }
+  function retake(){
+    if(state.mode==='sending')return;
+    const needsReconnect=state.reviewStreamDisconnected || !state.stream;
+    clearCaptured(); el.capturedPreview.classList.add('hidden'); el.guide.classList.remove('hidden'); el.reviewControls.classList.add('hidden'); el.captureControls.classList.remove('hidden');
+    state.reviewStreamDisconnected=false;
+    if(needsReconnect){
+      state.mode='starting'; disableCapture(true); setDeviceControlsDisabled(true); setStatus('カメラを再接続しています','warning');
+      startCamera(true).catch(handleCameraError);
+      return;
+    }
+    state.mode='live'; setDeviceControlsDisabled(false); disableCapture(!state.context); setStatus('撮影できます','ready');
+  }
   async function submitPhoto(){
     if(state.mode!=='review' || !state.capturedBlob || state.captureLock) return;
     if(!state.context) return showResult(false,'報告内容を確認できません','カメラ画面を閉じ、写真報告画面からもう一度開いてください。');
@@ -259,27 +280,29 @@
     clearTimeout(state.transferTimer); state.transferTimer=null; hideProgress();
     showResult(true,'写真を反映しました',data.message||'報告画面でコメントと内容を確認して送信してください。');
     state.intentionalStop=true; stopStream();
-    setTimeout(()=>{ postToParent({type:'PHOTO_REPORT_CAMERA_CLOSED'}); window.close(); },700);
+    setTimeout(()=>{ postToParent({type:'PHOTO_REPORT_CAMERA_CLOSED'}); window.close(); },autoReturnDelayMs());
   }
   function handleLegacySubmitSuccess(data){
     clearTimeout(state.transferTimer); state.transferTimer=null; hideProgress();
     showResult(true,'送信完了',(data.message||'写真を送信しました。')+(data.sentAtLabel?'\n送信時刻：'+data.sentAtLabel:''));
     state.intentionalStop=true; stopStream();
-    setTimeout(()=>{ postToParent({type:'PHOTO_REPORT_CAMERA_CLOSED'}); window.close(); },900);
+    setTimeout(()=>{ postToParent({type:'PHOTO_REPORT_CAMERA_CLOSED'}); window.close(); },autoReturnDelayMs());
   }
   function handleSubmitError(message){
-    clearTimeout(state.transferTimer); state.transferTimer=null; hideProgress(); state.mode='review'; state.captureLock=false;
+    clearTimeout(state.transferTimer); state.transferTimer=null; hideProgress(); state.mode='review'; state.captureLock=false; setDeviceControlsDisabled(true);
     el.sendButton.disabled=false; el.retakeButton.disabled=false;
     showResult(false,'写真を反映できませんでした',message+'\n撮影した写真は残っています。通信を確認して、もう一度「この写真を使用」を押してください。');
     setTimeout(hideResult,4200);
   }
 
-  function handleCameraError(error){ state.mode='error'; disableCapture(true); const message=humanCameraError(error); showError('カメラを使用できません',message); postToParent({type:'PHOTO_REPORT_CAMERA_ERROR',message:message}); }
+  function handleCameraError(error){ state.reviewStreamDisconnected=false; state.mode='error'; disableCapture(true); setDeviceControlsDisabled(false); const message=humanCameraError(error); showError('カメラを使用できません',message); postToParent({type:'PHOTO_REPORT_CAMERA_ERROR',message:message}); }
   function humanCameraError(error){ const name=String(error&&error.name||''); if(name==='NotAllowedError'||name==='PermissionDeniedError')return 'カメラの使用が許可されていません。アドレスバー左側のカメラ設定で許可し、再接続してください。'; if(name==='NotFoundError'||name==='DevicesNotFoundError')return '利用できるカメラが見つかりません。USBカメラの接続を確認してください。'; if(name==='NotReadableError'||name==='TrackStartError')return 'カメラを他のアプリが使用中です。SmartDC Pro、Windowsカメラ、Zoom等を閉じてください。'; if(name==='OverconstrainedError')return '指定したカメラ設定を使用できません。カメラを選び直してください。'; return String(error&&error.message||'カメラの起動に失敗しました。'); }
   function showError(title,message){ el.errorTitle.textContent=title; el.errorMessage.textContent=message; el.errorPanel.classList.remove('hidden'); setStatus(message,'error'); }
   function hideError(){ el.errorPanel.classList.add('hidden'); }
   function showFatal(title,message){ stopStream(); showError(title,message); el.retryCameraButton.classList.add('hidden'); el.captureControls.classList.add('hidden'); el.reviewControls.classList.add('hidden'); }
   function setStatus(text,type){ el.cameraStatus.classList.remove('error','warning'); if(type==='error')el.cameraStatus.classList.add('error'); else if(type==='warning')el.cameraStatus.classList.add('warning'); el.cameraStatusText.textContent=text; }
+  function autoReturnDelayMs(){ const seconds=Math.min(Math.max(Number(state.context&&state.context.autoReturnSeconds||2),1),10); return Math.round(seconds*1000); }
+  function setDeviceControlsDisabled(disabled){ el.cameraSelect.disabled=Boolean(disabled); el.switchCameraButton.disabled=Boolean(disabled); }
   function disableCapture(disabled){ el.captureButton.disabled=Boolean(disabled); }
   function clearCaptured(){ if(state.capturedUrl)URL.revokeObjectURL(state.capturedUrl); state.capturedUrl=''; state.capturedBlob=null; el.capturedPreview.removeAttribute('src'); }
   function showProgress(title,text){ el.progressTitle.textContent=title; el.progressText.textContent=text; el.progressOverlay.classList.remove('hidden'); }
